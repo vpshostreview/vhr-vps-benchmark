@@ -57,6 +57,18 @@ Options:
 | `-y`, `--yes` | Skip the install and upload confirmations |
 | `-h`, `--help` | Show help |
 
+## Uninstall
+
+Remove the tool, and optionally the benchmark packages it installed:
+
+```bash
+curl -fsSL https://github.com/vpshostreview/vhr-vps-benchmark/releases/latest/download/uninstall.sh | sudo bash
+```
+
+This removes `/usr/local/bin/vhr-bench` and offers to remove `sysbench` and `fio`. It does
+not remove `curl`, which is a core system utility. Pass `--keep-packages` to remove only the
+tool, or `--remove-curl` if you are certain you want curl gone as well.
+
 ## Requirements
 
 Linux with one of: `apt-get`, `dnf`, `yum`, `zypper`, or `apk`. The tool installs
