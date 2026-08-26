@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# vhr-bench — VPS Host Review benchmark tool
+# vhr-bench: VPS Host Review benchmark tool
 #
 # Measures CPU, memory, and disk performance of a Linux VPS, prints the exact JSON
 # payload it will send, asks for confirmation, then uploads the result to your
 # VPS Host Review account using your personal upload token.
 #
-# Nothing is uploaded without your confirmation. The source is public — read it before
+# Nothing is uploaded without your confirmation. The source is public. Read it before
 # running: https://github.com/vpshostreview/vhr-vps-benchmark
 #
 # Usage:

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# install.sh — installs the vhr-bench VPS benchmark tool into /usr/local/bin.
+# install.sh: installs the vhr-bench VPS benchmark tool into /usr/local/bin.
 #
 # Read this script before running it as root. It:
 #   1. Installs the runtime dependencies (sysbench, fio, curl) via your package manager.

@@ -1,7 +1,7 @@
-# vhr-bench — VPS Host Review benchmark tool
+# vhr-bench: VPS Host Review benchmark tool
 
-A free, open-source command-line tool that measures the real performance of any Linux VPS —
-processor, memory, and disk — and (optionally) uploads the result to your
+A free, open-source command-line tool that measures the real performance of any Linux VPS.
+It tests the processor, memory, and disk, and can optionally upload the result to your
 [VPS Host Review](https://vpshostreview.com) account so you can attach it to a review.
 
 **Read the source before you run it.** The tool is a single, readable Bash script:
@@ -16,8 +16,8 @@ confirmation before anything leaves your server.
 | Memory | `sysbench memory` | MB/s throughput |
 | Disk | `fio` (random 4k) | read/write IOPS and MB/s |
 
-It also records basic hardware context — processor model, core count, total memory,
-distribution, kernel, and virtualization type — so results are comparable.
+It also records basic hardware context (processor model, core count, total memory,
+distribution, kernel, and virtualization type) so results are comparable.
 
 ## What is NOT sent
 
@@ -65,4 +65,4 @@ under their own licenses; this project only invokes them and does not redistribu
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT. See [LICENSE](./LICENSE).
