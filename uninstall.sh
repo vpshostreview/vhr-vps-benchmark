@@ -65,7 +65,15 @@ if [[ $ASSUME_YES -eq 0 ]]; then
     else
         echo "curl is left in place (it is a core utility used by other software). Pass --remove-curl to override."
     fi
-    read -r -p "Remove these packages now ($pkgs)? [y/N] " reply
+    # When invoked as `curl ... | sudo bash`, stdin is the pipe, not the terminal, so read
+    # from the controlling terminal. With no terminal (truly non-interactive), do not guess.
+    if [[ -r /dev/tty ]]; then
+        read -r -p "Remove these packages now ($pkgs)? [y/N] " reply < /dev/tty
+    else
+        echo "No terminal available to confirm (for example when piped to bash)." >&2
+        echo "Re-run with --yes to remove sysbench and fio, or --keep-packages to remove only the tool." >&2
+        exit 0
+    fi
     [[ "$reply" =~ ^[Yy]$ ]] || { echo "No packages were removed."; exit 0; }
 fi
 
