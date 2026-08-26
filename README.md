@@ -25,6 +25,14 @@ Your hostname, IP address, file contents, and credentials are never collected or
 Results upload to your account and stay private until **you** choose to attach one to a
 review, which is the only way it becomes part of the public provider comparison.
 
+## How results are validated and shown
+
+Physically impossible results (values far beyond real hardware) are rejected by the server,
+so a lightly edited script cannot post absurd numbers. Published figures are medians, and a
+provider's comparison appears only once it has several independent benchmarks, so a single
+result never defines a provider's numbers. Results are community-submitted and are not
+independently verified.
+
 ## Install
 
 Review [`install.sh`](./install.sh) first, then:
