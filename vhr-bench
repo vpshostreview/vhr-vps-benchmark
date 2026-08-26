@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+#
+# vhr-bench — VPS Host Review benchmark tool
+#
+# Measures CPU, memory, and disk performance of a Linux VPS, prints the exact JSON
+# payload it will send, asks for confirmation, then uploads the result to your
+# VPS Host Review account using your personal upload token.
+#
+# Nothing is uploaded without your confirmation. The source is public — read it before
+# running: https://github.com/vpshostreview/vhr-vps-benchmark
+#
+# Usage:
+#   vhr-bench --token YOUR_UPLOAD_TOKEN
+#   VHR_BENCHMARK_TOKEN=... vhr-bench
+#   vhr-bench --token ... --api-url http://localhost:8080/api/benchmarks/submit   (local testing)
+#   vhr-bench --token ... --yes                                                   (skip confirmation)
+#
+# License: MIT
+set -euo pipefail
+
+DEFAULT_API_URL="https://vpshostreview.com/api/benchmarks/submit"
+API_URL="${VHR_BENCHMARK_API_URL:-$DEFAULT_API_URL}"
+TOKEN="${VHR_BENCHMARK_TOKEN:-}"
+ASSUME_YES=0
+
+# --- Argument parsing -------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --token)   TOKEN="${2:-}"; shift 2 ;;
+        --api-url) API_URL="${2:-}"; shift 2 ;;
+        -y|--yes)  ASSUME_YES=1; shift ;;
+        -h|--help)
+            grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -n 20
+            exit 0 ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+err() { echo "Error: $*" >&2; exit 1; }
+
+[[ -n "$TOKEN" ]] || err "No upload token. Pass --token or set VHR_BENCHMARK_TOKEN. Find your token at https://vpshostreview.com/user/benchmarks"
+
+# --- Dependency check / install --------------------------------------------
+need_install=()
+command -v sysbench >/dev/null 2>&1 || need_install+=("sysbench")
+command -v fio      >/dev/null 2>&1 || need_install+=("fio")
+command -v curl     >/dev/null 2>&1 || need_install+=("curl")
+
+if [[ ${#need_install[@]} -gt 0 ]]; then
+    echo "This tool needs: ${need_install[*]}"
+    if [[ $ASSUME_YES -eq 0 ]]; then
+        read -r -p "Install them now with your package manager (requires sudo)? [y/N] " reply
+        [[ "$reply" =~ ^[Yy]$ ]] || err "Cannot continue without: ${need_install[*]}"
+    fi
+    if   command -v apt-get >/dev/null 2>&1; then sudo apt-get update -y && sudo apt-get install -y "${need_install[@]}"
+    elif command -v dnf     >/dev/null 2>&1; then sudo dnf install -y "${need_install[@]}"
+    elif command -v yum     >/dev/null 2>&1; then sudo yum install -y "${need_install[@]}"
+    elif command -v zypper  >/dev/null 2>&1; then sudo zypper install -y "${need_install[@]}"
+    elif command -v apk     >/dev/null 2>&1; then sudo apk add "${need_install[@]}"
+    else err "No supported package manager found. Install manually: ${need_install[*]}"
+    fi
+fi
+
+# --- System context ---------------------------------------------------------
+cpu_cores="$(nproc 2>/dev/null || echo 1)"
+cpu_model="$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | sed 's/.*: //' || echo '')"
+[[ -n "$cpu_model" ]] || cpu_model="$(uname -p 2>/dev/null || echo unknown)"
+mem_kb="$(grep -m1 MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo 0)"
+ram_total_mb="$(( mem_kb / 1024 ))"
+distro="$( ( . /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-}" ) || echo '')"
+kernel="$(uname -r 2>/dev/null || echo '')"
+virt_type="$(systemd-detect-virt 2>/dev/null || echo 'unknown')"
+
+# --- Benchmarks -------------------------------------------------------------
+echo "Running CPU benchmark (sysbench)…"
+cpu_out="$(sysbench cpu --cpu-max-prime=20000 --threads="$cpu_cores" --time=10 run 2>/dev/null || true)"
+cpu_events="$(echo "$cpu_out" | grep -oE 'events per second:[[:space:]]*[0-9.]+' | grep -oE '[0-9.]+$' | head -1 || true)"
+cpu_events="${cpu_events:-0}"
+
+echo "Running memory benchmark (sysbench)…"
+mem_out="$(sysbench memory --memory-block-size=1M --memory-total-size=10G --memory-oper=write run 2>/dev/null || true)"
+mem_mibs="$(echo "$mem_out" | grep -oE '\([0-9.]+ MiB/sec\)' | grep -oE '[0-9.]+' | head -1 || true)"
+mem_mibs="${mem_mibs:-0}"
+memory_mb_per_sec="$(awk -v v="$mem_mibs" 'BEGIN{ printf "%.2f", v * 1.048576 }')"
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+parse_iops() { # $1 = fio normal output; echoes integer IOPS
+    echo "$1" | grep -oE 'IOPS=[0-9.]+[kMG]?' | head -1 | sed 's/IOPS=//' | awk '{
+        v=$0; m=1;
+        if (v ~ /k$/){m=1000; sub(/k/,"",v)}
+        else if (v ~ /M$/){m=1000000; sub(/M/,"",v)}
+        else if (v ~ /G$/){m=1000000000; sub(/G/,"",v)}
+        printf "%.0f", v*m }'
+}
+parse_bw_mbps() { # $1 = fio normal output; echoes MB/s from the "(NNNMB/s)" figure
+    echo "$1" | grep -oE '\([0-9.]+[kMG]?B/s\)' | head -1 | tr -d '()' | sed 's#B/s##' | awk '{
+        v=$0; m=1;
+        if (v ~ /G$/){m=1000; sub(/G/,"",v)}
+        else if (v ~ /M$/){m=1; sub(/M/,"",v)}
+        else if (v ~ /k$/){m=0.001; sub(/k/,"",v)}
+        printf "%.2f", v*m }'
+}
+
+echo "Running disk read benchmark (fio)…"
+rr="$(fio --name=randread --directory="$work" --ioengine=libaio --iodepth=16 --rw=randread \
+      --bs=4k --direct=1 --size=256M --numjobs=1 --runtime=15 --time_based --group_reporting 2>/dev/null || true)"
+disk_read_iops="$(parse_iops "$rr")"; disk_read_iops="${disk_read_iops:-0}"
+disk_read_mbps="$(parse_bw_mbps "$rr")"; disk_read_mbps="${disk_read_mbps:-0}"
+
+echo "Running disk write benchmark (fio)…"
+rw="$(fio --name=randwrite --directory="$work" --ioengine=libaio --iodepth=16 --rw=randwrite \
+      --bs=4k --direct=1 --size=256M --numjobs=1 --runtime=15 --time_based --group_reporting 2>/dev/null || true)"
+disk_write_iops="$(parse_iops "$rw")"; disk_write_iops="${disk_write_iops:-0}"
+disk_write_mbps="$(parse_bw_mbps "$rw")"; disk_write_mbps="${disk_write_mbps:-0}"
+
+# --- Build payload ----------------------------------------------------------
+json_escape() { echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+payload=$(cat <<EOF
+{
+  "cpuEventsPerSec": ${cpu_events},
+  "memoryMbPerSec": ${memory_mb_per_sec},
+  "diskReadIops": ${disk_read_iops},
+  "diskWriteIops": ${disk_write_iops},
+  "diskReadMbps": ${disk_read_mbps},
+  "diskWriteMbps": ${disk_write_mbps},
+  "cpuModel": "$(json_escape "$cpu_model")",
+  "cpuCores": ${cpu_cores},
+  "ramTotalMb": ${ram_total_mb},
+  "distro": "$(json_escape "$distro")",
+  "kernel": "$(json_escape "$kernel")",
+  "virtType": "$(json_escape "$virt_type")"
+}
+EOF
+)
+
+echo
+echo "This is the exact data that will be uploaded to your account:"
+echo "------------------------------------------------------------"
+echo "$payload"
+echo "------------------------------------------------------------"
+
+if [[ $ASSUME_YES -eq 0 ]]; then
+    read -r -p "Upload this result to your VPS Host Review account? [y/N] " reply
+    [[ "$reply" =~ ^[Yy]$ ]] || { echo "Aborted. Nothing was uploaded."; exit 0; }
+fi
+
+echo "Uploading…"
+response="$(curl -fsS -X POST "$API_URL" \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "$payload" 2>&1)" || err "Upload failed: $response"
+
+echo "Done. Server response:"
+echo "$response"
+echo
+echo "View it and attach it to a review at https://vpshostreview.com/user/benchmarks"
