@@ -156,4 +156,13 @@ response="$(curl -fsS -X POST "$API_URL" \
 echo "Done. Server response:"
 echo "$response"
 echo
-echo "View it and attach it to a review at https://vpshostreview.com/user/benchmarks"
+# The server answers with the address of the review form for this result. A result is
+# published only through a review of the host it measured, so that is the next step;
+# the portal link stays as the fallback for a response the pattern does not match.
+review_url="$(printf '%s' "$response" | sed -n 's/.*"reviewUrl":"\([^"]*\)".*/\1/p')"
+if [[ -n "$review_url" ]]; then
+    echo "Publish it by reviewing the host you just measured: ${review_url}"
+    echo "The result is attached to that review when you submit it."
+else
+    echo "Publish it by reviewing the host you measured: https://vpshostreview.com/user/benchmarks"
+fi

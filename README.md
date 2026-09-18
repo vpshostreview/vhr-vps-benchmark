@@ -2,7 +2,9 @@
 
 A free, open-source command-line tool that measures the real performance of any Linux VPS.
 It tests the processor, memory, and disk, and can optionally upload the result to your
-[VPS Host Review](https://vpshostreview.com) account so you can attach it to a review.
+[VPS Host Review](https://vpshostreview.com) account. A result is published through your
+review of the host you measured: the tool prints the link to that review form after the
+upload, and submitting the review attaches the result to it.
 
 **Read the source before you run it.** The tool is a single, readable Bash script:
 [`vhr-bench`](./vhr-bench). It prints the exact JSON it will send and asks for your
