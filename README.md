@@ -1,14 +1,17 @@
 # vhr-bench: VPS Host Review benchmark tool
 
 A free, open-source command-line tool that measures the real performance of any Linux VPS.
-It tests the processor, memory, and disk, and can optionally upload the result to your
-[VPS Host Review](https://vpshostreview.com) account. A result is published through your
-review of the host you measured: the tool prints the link to that review form after the
-upload, and submitting the review attaches the result to it.
+It tests the processor, memory, and disk and prints the results. No account is needed.
+
+If you want to compare your server with other people's, you can optionally upload the
+result to your [VPS Host Review](https://vpshostreview.com) account. A result is published
+through your review of the host you measured: the tool prints the link to that review form
+after the upload, and submitting the review attaches the result to it.
 
 **Read the source before you run it.** The tool is a single, readable Bash script:
-[`vhr-bench`](./vhr-bench). It prints the exact JSON it will send and asks for your
-confirmation before anything leaves your server.
+[`vhr-bench`](./vhr-bench). Without a token it sends nothing anywhere. With one, it prints
+the exact JSON it will send and asks for your confirmation before anything leaves your
+server.
 
 ## What it measures
 
@@ -29,6 +32,8 @@ review, which is the only way it becomes part of the public provider comparison.
 
 ## How results are validated and shown
 
+A benchmark that fails on your server is shown as "not measured", and a run with any reading
+missing uploads nothing, so a partial result never reaches the comparison.
 Physically impossible results (values far beyond real hardware) are rejected by the server,
 so a lightly edited script cannot post absurd numbers. Published figures are medians, and a
 provider's comparison appears only once it has several independent benchmarks, so a single
@@ -52,7 +57,14 @@ sha256sum /usr/local/bin/vhr-bench
 
 ## Run
 
-Get your personal upload token from <https://vpshostreview.com/user/benchmarks>, then:
+```bash
+vhr-bench
+```
+
+The results print on screen when the run finishes, in about a minute. Nothing is uploaded.
+
+To upload a result as well, get your personal upload token from
+<https://vpshostreview.com/user/benchmarks>, then:
 
 ```bash
 vhr-bench --token YOUR_UPLOAD_TOKEN
@@ -62,7 +74,7 @@ Options:
 
 | Flag | Purpose |
 |---|---|
-| `--token TOKEN` | Your upload token (or set `VHR_BENCHMARK_TOKEN`) |
+| `--token TOKEN` | Upload the result to your account (or set `VHR_BENCHMARK_TOKEN`) |
 | `--api-url URL` | Override the submit endpoint (for local testing) |
 | `-y`, `--yes` | Skip the install and upload confirmations |
 | `-h`, `--help` | Show help |

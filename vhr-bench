@@ -2,18 +2,19 @@
 #
 # vhr-bench: VPS Host Review benchmark tool
 #
-# Measures CPU, memory, and disk performance of a Linux VPS, prints the exact JSON
-# payload it will send, asks for confirmation, then uploads the result to your
-# VPS Host Review account using your personal upload token.
+# Measures CPU, memory, and disk performance of a Linux VPS and prints the results.
+# No account is needed. With an upload token it also prints the exact JSON payload,
+# asks for confirmation, and uploads the result to your VPS Host Review account.
 #
-# Nothing is uploaded without your confirmation. The source is public. Read it before
-# running: https://github.com/vpshostreview/vhr-vps-benchmark
+# Nothing is uploaded without a token and your confirmation. The source is public.
+# Read it before running: https://github.com/vpshostreview/vhr-vps-benchmark
 #
 # Usage:
-#   vhr-bench --token YOUR_UPLOAD_TOKEN
+#   vhr-bench                                  (measure and print, upload nothing)
+#   vhr-bench --token YOUR_UPLOAD_TOKEN        (measure, then offer to upload)
 #   VHR_BENCHMARK_TOKEN=... vhr-bench
-#   vhr-bench --token ... --api-url http://localhost:8080/api/benchmarks/submit   (local testing)
-#   vhr-bench --token ... --yes                                                   (skip confirmation)
+#   vhr-bench --token ... --api-url http://localhost:8080/api/benchmarks/submit
+#   vhr-bench --yes                            (skip the install and upload prompts)
 #
 # License: MIT
 set -euo pipefail
@@ -30,7 +31,7 @@ while [[ $# -gt 0 ]]; do
         --api-url) API_URL="${2:-}"; shift 2 ;;
         -y|--yes)  ASSUME_YES=1; shift ;;
         -h|--help)
-            grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -n 20
+            sed -n '3,/^# License/p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
@@ -38,13 +39,14 @@ done
 
 err() { echo "Error: $*" >&2; exit 1; }
 
-[[ -n "$TOKEN" ]] || err "No upload token. Pass --token or set VHR_BENCHMARK_TOKEN. Find your token at https://vpshostreview.com/user/benchmarks"
-
 # --- Dependency check / install --------------------------------------------
+# curl is only needed to upload, so a run without a token does not ask for it.
 need_install=()
 command -v sysbench >/dev/null 2>&1 || need_install+=("sysbench")
 command -v fio      >/dev/null 2>&1 || need_install+=("fio")
-command -v curl     >/dev/null 2>&1 || need_install+=("curl")
+if [[ -n "$TOKEN" ]]; then
+    command -v curl >/dev/null 2>&1 || need_install+=("curl")
+fi
 
 if [[ ${#need_install[@]} -gt 0 ]]; then
     echo "This tool needs: ${need_install[*]}"
@@ -63,7 +65,7 @@ fi
 
 # --- System context ---------------------------------------------------------
 cpu_cores="$(nproc 2>/dev/null || echo 1)"
-cpu_model="$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | sed 's/.*: //' || echo '')"
+cpu_model="$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | sed 's/.*: //; s/[[:space:]]*$//' || echo '')"
 [[ -n "$cpu_model" ]] || cpu_model="$(uname -p 2>/dev/null || echo unknown)"
 mem_kb="$(grep -m1 MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo 0)"
 ram_total_mb="$(( mem_kb / 1024 ))"
@@ -86,13 +88,15 @@ memory_mb_per_sec="$(awk -v v="$mem_mibs" 'BEGIN{ printf "%.2f", v * 1.048576 }'
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
+# Both parsers end in "|| true": under pipefail a grep that matches nothing would
+# otherwise end the whole script without a word when fio fails on a server.
 parse_iops() { # $1 = fio normal output; echoes integer IOPS
     echo "$1" | grep -oE 'IOPS=[0-9.]+[kMG]?' | head -1 | sed 's/IOPS=//' | awk '{
         v=$0; m=1;
         if (v ~ /k$/){m=1000; sub(/k/,"",v)}
         else if (v ~ /M$/){m=1000000; sub(/M/,"",v)}
         else if (v ~ /G$/){m=1000000000; sub(/G/,"",v)}
-        printf "%.0f", v*m }'
+        printf "%.0f", v*m }' || true
 }
 parse_bw_mbps() { # $1 = fio normal output; echoes MB/s from the "(NNNMB/s)" figure
     echo "$1" | grep -oE '\([0-9.]+[kMG]?B/s\)' | head -1 | tr -d '()' | sed 's#B/s##' | awk '{
@@ -100,7 +104,7 @@ parse_bw_mbps() { # $1 = fio normal output; echoes MB/s from the "(NNNMB/s)" fig
         if (v ~ /G$/){m=1000; sub(/G/,"",v)}
         else if (v ~ /M$/){m=1; sub(/M/,"",v)}
         else if (v ~ /k$/){m=0.001; sub(/k/,"",v)}
-        printf "%.2f", v*m }'
+        printf "%.2f", v*m }' || true
 }
 
 echo "Running disk read benchmark (fio)…"
@@ -114,6 +118,48 @@ rw="$(fio --name=randwrite --directory="$work" --ioengine=libaio --iodepth=16 --
       --bs=4k --direct=1 --size=256M --numjobs=1 --runtime=15 --time_based --group_reporting 2>/dev/null || true)"
 disk_write_iops="$(parse_iops "$rw")"; disk_write_iops="${disk_write_iops:-0}"
 disk_write_mbps="$(parse_bw_mbps "$rw")"; disk_write_mbps="${disk_write_mbps:-0}"
+
+# --- Results ----------------------------------------------------------------
+# A zero means the benchmark failed or printed nothing readable, so it is shown as
+# not measured rather than as a result, and it is never uploaded.
+is_zero() { [[ "$1" =~ ^0+(\.0+)?$ ]]; }
+show() { # $1 = the value, $2 = the line to print when it is a real reading
+    if is_zero "$1"; then echo "not measured"; else echo "$2"; fi
+}
+missing=()
+if is_zero "$cpu_events";        then missing+=("processor");  fi
+if is_zero "$memory_mb_per_sec"; then missing+=("memory");     fi
+if is_zero "$disk_read_iops";    then missing+=("disk read");  fi
+if is_zero "$disk_write_iops";   then missing+=("disk write"); fi
+
+echo
+echo "vhr-bench results"
+echo "------------------------------------------------------------"
+printf '  %-11s %s\n' "Processor" "$(show "$cpu_events" "$cpu_events events/s (sysbench, $cpu_cores threads)")"
+printf '  %-11s %s\n' "Memory" "$(show "$memory_mb_per_sec" "$memory_mb_per_sec MB/s (sysbench, 1M block writes)")"
+printf '  %-11s %s\n' "Disk read" "$(show "$disk_read_iops" "$disk_read_iops IOPS, $disk_read_mbps MB/s (fio, random 4k)")"
+printf '  %-11s %s\n' "Disk write" "$(show "$disk_write_iops" "$disk_write_iops IOPS, $disk_write_mbps MB/s (fio, random 4k)")"
+printf '  %-11s %s, %s cores, %s MB RAM\n' "Hardware" "$cpu_model" "$cpu_cores" "$ram_total_mb"
+printf '  %-11s %s, kernel %s, %s\n' "System" "${distro:-unknown}" "${kernel:-unknown}" "$virt_type"
+echo "------------------------------------------------------------"
+
+if [[ ${#missing[@]} -gt 0 ]]; then
+    printf -v missing_list '%s, ' "${missing[@]}"
+    echo
+    echo "Not measured: ${missing_list%, }. The benchmark behind each of these failed or"
+    echo "printed nothing readable on this server, so nothing was uploaded."
+    exit 1
+fi
+
+if [[ -z "$TOKEN" ]]; then
+    echo
+    echo "Nothing was uploaded. To compare this server with results from other hosts,"
+    echo "create a free account, copy your upload token from"
+    echo "https://vpshostreview.com/user/benchmarks and run:"
+    echo "  vhr-bench --token YOUR_UPLOAD_TOKEN"
+    echo "Published comparisons: https://vpshostreview.com/vps-benchmarks"
+    exit 0
+fi
 
 # --- Build payload ----------------------------------------------------------
 json_escape() { echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }

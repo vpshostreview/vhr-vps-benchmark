@@ -4,8 +4,8 @@
 #
 # Read this script before running it as root. It:
 #   1. Installs the runtime dependencies (sysbench, fio, curl) via your package manager.
-#   2. Downloads the vhr-bench script from the pinned release and installs it to
-#      /usr/local/bin/vhr-bench.
+#   2. Downloads the vhr-bench script from main (or the tag named in VHR_BENCH_REF)
+#      and installs it to /usr/local/bin/vhr-bench.
 #
 # Usage:
 #   curl -fsSL https://github.com/vpshostreview/vhr-vps-benchmark/releases/latest/download/install.sh | sudo bash
@@ -38,5 +38,6 @@ curl -fsSL "${REPO_RAW}/${REF}/vhr-bench" -o "$DEST"
 chmod +x "$DEST"
 
 echo "Installed to ${DEST}."
-echo "Run it with:  vhr-bench --token YOUR_UPLOAD_TOKEN"
-echo "Get your token at https://vpshostreview.com/user/benchmarks"
+echo "Run it with:  vhr-bench"
+echo "To upload a result to your account, add --token YOUR_UPLOAD_TOKEN"
+echo "(get one at https://vpshostreview.com/user/benchmarks)."
