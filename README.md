@@ -63,6 +63,10 @@ vhr-bench
 
 The results print on screen when the run finishes, in about a minute. Nothing is uploaded.
 
+![Terminal showing vhr-bench results: processor, memory, disk read and disk write figures, then hardware and system details](docs/vhr-bench-output.png)
+
+Output from a real run on a 4-core GitHub Actions runner.
+
 To upload a result as well, get your personal upload token from
 <https://vpshostreview.com/user/benchmarks>, then:
 
