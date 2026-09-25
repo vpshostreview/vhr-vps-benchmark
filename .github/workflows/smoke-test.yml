@@ -1,0 +1,35 @@
+# Runs vhr-bench end to end on a clean Ubuntu machine, the way a first-time user would
+# run it: no account and no token. A benchmark that fails prints "not measured" and
+# exits non-zero, so a regression in any of the four readings fails this job rather
+# than shipping.
+name: Smoke test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  run-without-a-token:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check that the scripts parse
+        run: bash -n vhr-bench install.sh uninstall.sh
+
+      - name: Install sysbench and fio
+        run: sudo apt-get update && sudo apt-get install -y sysbench fio
+
+      - name: Run vhr-bench without a token
+        run: bash vhr-bench | tee result.txt
+
+      - name: Check that every reading was taken and nothing was uploaded
+        run: |
+          grep -q "vhr-bench results" result.txt
+          grep -q "Nothing was uploaded" result.txt
+          if grep -q "not measured" result.txt; then exit 1; fi
