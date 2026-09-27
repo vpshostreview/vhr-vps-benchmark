@@ -1,0 +1,48 @@
+# Publishes a release when a version tag is pushed (git tag v1.3.0 && git push origin
+# v1.3.0). The website's commands download install.sh, uninstall.sh and vhr-bench from
+# the latest release, so building that release by hand risked a forgotten upload
+# silently serving an old vhr-bench that rejects the options the site shows. Here the
+# three files come from the tagged commit, only after the whole smoke test has passed on
+# that commit, and an existing release is never replaced.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-test:
+    uses: ./.github/workflows/smoke-test.yml
+
+  release:
+    needs: smoke-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Refuse to replace an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "::error::A release named $GITHUB_REF_NAME already exists. Releases are never replaced; tag a new version instead."
+            exit 1
+          fi
+
+      # The README tells users to check what they downloaded against these checksums.
+      - name: Write the SHA-256 checksums of the three files
+        run: sha256sum install.sh uninstall.sh vhr-bench > SHA256SUMS
+
+      # gh release create also refuses a tag that already has a release, so a release
+      # made between the check above and this step still fails rather than being replaced.
+      - name: Create the release with install.sh, uninstall.sh, vhr-bench and SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" install.sh uninstall.sh vhr-bench SHA256SUMS
+          --verify-tag --title "$GITHUB_REF_NAME" --generate-notes

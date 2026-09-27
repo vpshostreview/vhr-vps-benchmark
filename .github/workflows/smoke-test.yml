@@ -1,7 +1,10 @@
 # Runs vhr-bench end to end on a clean Ubuntu machine, the way a first-time user would
 # run it: no account and no token. A benchmark that fails prints "not measured" and
 # exits non-zero, so a regression in any of the four readings fails this job rather
-# than shipping.
+# than shipping. The other jobs run the one-command form (piped into bash with
+# --cleanup) and check that it removes exactly the packages it installed, on the
+# runner and on Debian, Fedora and Alpine. The release workflow runs all of it again
+# before it publishes anything.
 name: Smoke test
 
 on:
@@ -9,6 +12,7 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -19,8 +23,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # One file per bash -n: given several, bash parses only the first and treats the
+      # rest as its arguments.
       - name: Check that the scripts parse
-        run: bash -n vhr-bench install.sh uninstall.sh
+        run: for f in vhr-bench install.sh uninstall.sh .github/scripts/check-cleanup.sh; do bash -n "$f"; done
 
       - name: Install sysbench and fio
         run: sudo apt-get update && sudo apt-get install -y sysbench fio
@@ -33,3 +39,65 @@ jobs:
           grep -q "vhr-bench results" result.txt
           grep -q "Nothing was uploaded" result.txt
           if grep -q "not measured" result.txt; then exit 1; fi
+
+  run-through-a-pipe-with-cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The runner image does not ship them today. If a future image does, remove them
+      # so the run still has to install them, which is what this job tests.
+      - name: Make sure sysbench and fio are not installed
+        run: |
+          if command -v sysbench >/dev/null || command -v fio >/dev/null; then
+            echo "::notice::The runner image ships sysbench or fio; removing them before the test."
+            sudo apt-get purge -y sysbench fio
+          fi
+
+      - name: Check that --help works when piped
+        run: |
+          help="$(cat vhr-bench | bash -s -- --help)"
+          grep -q -- "--cleanup" <<<"$help"
+
+      # setsid starts the run without a controlling terminal, as cron or ssh without -t
+      # would, so the install prompt has nothing to read and must say so.
+      - name: Check that a prompt with no terminal declines with a message
+        run: |
+          set +e
+          timeout 120 setsid -w bash -c 'cat vhr-bench | bash -s -- --cleanup' > no-tty.txt 2>&1
+          status=$?
+          set -e
+          cat no-tty.txt
+          test "$status" -eq 1
+          grep -q "Pass --yes to answer yes in advance." no-tty.txt
+          grep -q "Cleanup: this run installed no packages, so nothing was removed." no-tty.txt
+          if command -v sysbench || command -v fio; then exit 1; fi
+
+      - name: Run it piped into bash with --cleanup and compare the package lists
+        run: bash .github/scripts/check-cleanup.sh --require-readings
+
+  cleanup-in-containers:
+    name: Cleanup in ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # apt as root on an image with no sudo, and mawk as awk.
+          - image: debian:stable
+            prepare: "true"
+          # dnf and rpm. sysbench and fio are in Fedora's own repositories.
+          - image: fedora:latest
+            prepare: "command -v awk >/dev/null || dnf install -y gawk"
+          # apk and busybox. sysbench and fio are in the community repository, which
+          # the image enables. bash is added first because vhr-bench is a bash script.
+          - image: alpine:3.24
+            prepare: "apk add --no-cache bash"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run it piped into bash with --cleanup and compare the package lists
+        env:
+          IMAGE: ${{ matrix.image }}
+          PREPARE: ${{ matrix.prepare }}
+        run: docker run --rm -v "$PWD:/src:ro" -w /src "$IMAGE" sh -c "$PREPARE && bash .github/scripts/check-cleanup.sh"

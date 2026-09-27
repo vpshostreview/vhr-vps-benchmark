@@ -9,84 +9,657 @@
 # Nothing is uploaded without a token and your confirmation. The source is public.
 # Read it before running: https://github.com/vpshostreview/vhr-vps-benchmark
 #
-# Usage:
-#   vhr-bench                                  (measure and print, upload nothing)
-#   vhr-bench --token YOUR_UPLOAD_TOKEN        (measure, then offer to upload)
-#   VHR_BENCHMARK_TOKEN=... vhr-bench
-#   vhr-bench --token ... --api-url http://localhost:8080/api/benchmarks/submit
-#   vhr-bench --yes                            (skip the install and upload prompts)
+# The commands and options are in usage() just below, or run: vhr-bench --help
+#
+# The script is nothing but function definitions until its last line, which calls
+# main. bash reads a whole function definition before it runs any of it, so when the
+# script is piped into bash (curl ... | bash) nothing runs until every line has arrived.
+# A download cut off partway therefore runs nothing, and a program that reads its input
+# while the benchmark runs (a package manager, a prompt) finds the end of the pipe
+# rather than swallowing the rest of the script.
 #
 # License: MIT
-set -euo pipefail
 
-DEFAULT_API_URL="https://vpshostreview.com/api/benchmarks/submit"
-API_URL="${VHR_BENCHMARK_API_URL:-$DEFAULT_API_URL}"
-TOKEN="${VHR_BENCHMARK_TOKEN:-}"
-ASSUME_YES=0
+usage() {
+    cat <<'EOF'
+vhr-bench: VPS Host Review benchmark tool
 
-# --- Argument parsing -------------------------------------------------------
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --token)   TOKEN="${2:-}"; shift 2 ;;
-        --api-url) API_URL="${2:-}"; shift 2 ;;
-        -y|--yes)  ASSUME_YES=1; shift ;;
-        -h|--help)
-            sed -n '3,/^# License/p' "$0" | sed 's/^# \{0,1\}//'
-            exit 0 ;;
-        *) echo "Unknown option: $1" >&2; exit 1 ;;
-    esac
-done
+Measures CPU, memory, and disk performance of a Linux VPS and prints the results.
+No account is needed. With an upload token it also prints the exact JSON payload,
+asks for confirmation, and uploads the result to your VPS Host Review account.
 
+Nothing is uploaded without a token and your confirmation. The source is public.
+Read it before running: https://github.com/vpshostreview/vhr-vps-benchmark
+
+Usage:
+  vhr-bench                                  (measure and print, upload nothing)
+  vhr-bench --token YOUR_UPLOAD_TOKEN        (measure, then offer to upload)
+  VHR_BENCHMARK_TOKEN=... vhr-bench
+  vhr-bench --token ... --api-url http://localhost:8080/api/benchmarks/submit
+  vhr-bench --yes                            (skip the install and upload prompts)
+  vhr-bench --cleanup                        (remove the packages this run installs)
+
+Run it once without installing vhr-bench, and remove the packages it installed:
+  curl -fsSL https://github.com/vpshostreview/vhr-vps-benchmark/releases/latest/download/vhr-bench | bash -s -- --cleanup
+
+Options:
+  --token TOKEN   Upload the result to your account (or set VHR_BENCHMARK_TOKEN)
+  --api-url URL   Override the submit endpoint (for local testing)
+  --cleanup       When the run ends, remove the packages this run installed
+  -y, --yes       Skip the install and upload confirmations
+  -h, --help      Show this help
+
+License: MIT
+EOF
+}
+
+# --- Helpers ----------------------------------------------------------------
 err() { echo "Error: $*" >&2; exit 1; }
 
-# --- Dependency check / install --------------------------------------------
-# curl is only needed to upload, so a run without a token does not ask for it.
-need_install=()
-command -v sysbench >/dev/null 2>&1 || need_install+=("sysbench")
-command -v fio      >/dev/null 2>&1 || need_install+=("fio")
-if [[ -n "$TOKEN" ]]; then
-    command -v curl >/dev/null 2>&1 || need_install+=("curl")
-fi
+is_root() { [[ "$(id -u)" -eq 0 ]]; }
 
-if [[ ${#need_install[@]} -gt 0 ]]; then
-    echo "This tool needs: ${need_install[*]}"
-    if [[ $ASSUME_YES -eq 0 ]]; then
-        read -r -p "Install them now with your package manager (requires sudo)? [y/N] " reply
-        [[ "$reply" =~ ^[Yy]$ ]] || err "Cannot continue without: ${need_install[*]}"
+# Runs a command as root: directly when the script already runs as root, which is
+# common on a VPS, and through sudo otherwise. Minimal images often have no sudo at all,
+# which is why sudo is never assumed.
+as_root() {
+    if is_root; then "$@"; else sudo "$@"; fi
+}
+
+# What to type in front of a command that needs root, for the commands printed on screen.
+root_prefix() { is_root || printf 'sudo '; }
+
+# ask QUESTION: shows the question and succeeds only when the answer is y or Y.
+ask() {
+    local reply=""
+    if [[ -t 0 ]]; then
+        read -r -p "$1 [y/N] " reply || true
+    elif (: </dev/tty) 2>/dev/null; then
+        # Piped into bash, stdin is the script itself, so the answer is read from the
+        # terminal instead. The device is opened as the test rather than checked with -r,
+        # because /dev/tty exists even where there is no terminal (cron, CI, ssh without
+        # -t) and only opening it fails.
+        read -r -p "$1 [y/N] " reply </dev/tty || true
+    else
+        # With no terminal at all a read would fail, and set -e would end the run on the
+        # spot without a word, so the answer is no and the reason is printed.
+        echo "$1 [y/N]"
+        echo "There is no terminal to answer on, so the answer is no. Pass --yes to answer yes in advance." >&2
+        return 1
     fi
-    if   command -v apt-get >/dev/null 2>&1; then sudo apt-get update -y && sudo apt-get install -y "${need_install[@]}"
-    elif command -v dnf     >/dev/null 2>&1; then sudo dnf install -y "${need_install[@]}"
-    elif command -v yum     >/dev/null 2>&1; then sudo yum install -y "${need_install[@]}"
-    elif command -v zypper  >/dev/null 2>&1; then sudo zypper install -y "${need_install[@]}"
-    elif command -v apk     >/dev/null 2>&1; then sudo apk add "${need_install[@]}"
-    else err "No supported package manager found. Install manually: ${need_install[*]}"
+    [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+# lines_not_in LIST EXCLUDE: prints the lines of LIST that are not lines of EXCLUDE.
+lines_not_in() {
+    awk 'NR == FNR { skip[$0]; next } $0 != "" && !($0 in skip)' <(printf '%s\n' "$2") <(printf '%s\n' "$1")
+}
+
+# lines_in LIST KEEP: prints the lines of LIST that are also lines of KEEP.
+lines_in() {
+    awk 'NR == FNR { keep[$0]; next } $0 != "" && ($0 in keep)' <(printf '%s\n' "$2") <(printf '%s\n' "$1")
+}
+
+# Runs a removal as root so that it cannot be cut short once it has started: a package
+# manager stopped partway leaves a package half removed. The shell that starts it ignores
+# Ctrl+C, a hangup and a plain kill, and exec keeps them ignored in the command itself,
+# whether or not sudo sits in between. A second Ctrl+C during cleanup can therefore only
+# stop the waiting between tries, never a removal already under way.
+as_root_uninterruptible() {
+    as_root sh -c 'trap "" INT TERM HUP; exec "$@"' vhr-bench "$@"
+}
+
+# --- Installing the tools, and removing them again with --cleanup ---------
+#
+# --cleanup removes exactly the packages this run installed. It must never remove a
+# package that was installed before the run, and never one that another process
+# installed while the run was going. The second is a real risk on a fresh VPS, where
+# unattended upgrades often install a new kernel in the first minutes after boot, so a
+# before-and-after comparison of the package list is not enough on its own. Instead,
+# each package manager's own record identifies this run's transaction, only what that
+# transaction installed (and was not there before) is removed, and the removal uses a
+# command that refuses to take anything else with it. A package the transaction installed
+# in place of one that was already here (a replacement or a rename) stays, like an
+# upgrade, because removing it would leave neither. Whenever any of that cannot be
+# established, nothing is removed and the run prints what was left and how to remove it.
+#
+# State these functions share, set by main and install_packages:
+#   PKG_MANAGER        the package manager this run installed with
+#   REQUESTED          the packages this run asked it to install
+#   INSTALL_STARTED    1 once the install command has been started
+#   PKGS_BEFORE        the packages present before the install (--cleanup only)
+#   RUN_ID             a random id that marks this run's transaction (--cleanup only)
+#   RPM_T0, RPM_NOTHING_DONE   when the rpm install started, and whether it did nothing
+
+# Installs the named packages. With --cleanup it first records what is installed.
+install_packages() {
+    REQUESTED=("$@")
+    if   command -v apt-get >/dev/null 2>&1; then PKG_MANAGER=apt-get
+    elif command -v dnf     >/dev/null 2>&1; then PKG_MANAGER=dnf
+    elif command -v yum     >/dev/null 2>&1; then PKG_MANAGER=yum
+    elif command -v zypper  >/dev/null 2>&1; then PKG_MANAGER=zypper
+    elif command -v apk     >/dev/null 2>&1; then PKG_MANAGER=apk
+    else err "No supported package manager found. Install manually: $*"
     fi
-fi
 
-# --- System context ---------------------------------------------------------
-cpu_cores="$(nproc 2>/dev/null || echo 1)"
-cpu_model="$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | sed 's/.*: //; s/[[:space:]]*$//' || echo '')"
-[[ -n "$cpu_model" ]] || cpu_model="$(uname -p 2>/dev/null || echo unknown)"
-mem_kb="$(grep -m1 MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo 0)"
-ram_total_mb="$(( mem_kb / 1024 ))"
-distro="$( ( . /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-}" ) || echo '')"
-kernel="$(uname -r 2>/dev/null || echo '')"
-virt_type="$(systemd-detect-virt 2>/dev/null || echo 'unknown')"
+    if [[ $CLEANUP -eq 1 ]]; then
+        PKGS_BEFORE="$(installed_packages)" ||
+            err "--cleanup could not list the installed packages, so nothing was installed."
+        # Sixteen hex digits, always the same length, so no run's id is the start of another's.
+        RUN_ID="$(printf '%04x%04x%04x%04x' "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM")"
+    fi
 
-# --- Benchmarks -------------------------------------------------------------
-echo "Running CPU benchmark (sysbench)…"
-cpu_out="$(sysbench cpu --cpu-max-prime=20000 --threads="$cpu_cores" --time=10 run 2>/dev/null || true)"
-cpu_events="$(echo "$cpu_out" | grep -oE 'events per second:[[:space:]]*[0-9.]+' | grep -oE '[0-9.]+$' | head -1 || true)"
-cpu_events="${cpu_events:-0}"
+    INSTALL_STARTED=1
+    case "$PKG_MANAGER" in
+        apt-get)
+            apt_update || err "apt-get update failed (its message is above)."
+            # --no-remove: a benchmark must never remove software to make room for its
+            # tools. If apt would have to, it stops instead.
+            if [[ $CLEANUP -eq 1 ]]; then
+                # The -o option does nothing except appear in apt's history log, where
+                # apt_history_of_this_run finds this run's transaction by it.
+                apt_get -o "VhrBench::Run=$RUN_ID" install -y --no-remove "$@"
+            else
+                apt_get install -y --no-remove "$@"
+            fi ;;
+        dnf|yum|zypper) rpm_install "$@" ;;
+        apk)
+            if [[ $CLEANUP -eq 1 ]]; then
+                as_root apk add --virtual ".vhr-bench-$RUN_ID" "$@"
+            else
+                as_root apk add "$@"
+            fi ;;
+    esac || err "Could not install $* with $PKG_MANAGER (its message is above)."
+}
 
-echo "Running memory benchmark (sysbench)…"
-mem_out="$(sysbench memory --memory-block-size=1M --memory-total-size=10G --memory-oper=write run 2>/dev/null || true)"
-mem_mibs="$(echo "$mem_out" | grep -oE '\([0-9.]+ MiB/sec\)' | grep -oE '[0-9.]+' | head -1 || true)"
-mem_mibs="${mem_mibs:-0}"
-memory_mb_per_sec="$(awk -v v="$mem_mibs" 'BEGIN{ printf "%.2f", v * 1.048576 }')"
+# Prints the installed packages, one per line, in the form each cleanup compares. For
+# rpm that is NAME.ARCH, followed by the full NAME-VERSION-RELEASE.ARCH, which tells
+# apart the package signing keys rpm lists as packages that all share one NAME.ARCH.
+installed_packages() {
+    case "$PKG_MANAGER" in
+        apt-get)        dpkg_known_packages ;;
+        dnf|yum|zypper) rpm -qa --qf '%{NAME}.%{ARCH} %{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' ;;
+        apk)            apk info ;;
+    esac
+}
 
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+# Runs on every exit once the run has started: a normal finish, any "exit 1", an error
+# under set -e, and the signals main turns into exits: Ctrl+C, a hangup (the terminal or
+# the SSH session went away), output with no reader left (piped into head, or into a tee
+# that Ctrl+C stopped) and a plain kill. Nothing can run after kill -9 or a power cut, so
+# no message promises otherwise.
+on_exit() {
+    local status=$?
+    # With nobody left reading the output, the next write would raise SIGPIPE and end the
+    # shell in the middle of this function, so it is ignored: a write that fails is lost,
+    # and the cleanup goes on regardless.
+    trap '' PIPE
+    set +e    # a failed step here is reported, and must not cut the rest short
+    CLEANUP_INTERRUPTED=0
+    trap 'CLEANUP_INTERRUPTED=1' INT TERM HUP
+    # The temporary directory goes last: the rpm cleanup reads the package manager's
+    # output that the install kept there.
+    if [[ $CLEANUP -eq 1 ]]; then
+        # The blank line doubles as a test that the output still reaches someone. When it
+        # does not, the outcome goes to the terminal, or failing that to stderr.
+        if ! echo 2>/dev/null; then
+            if (: >/dev/tty) 2>/dev/null; then exec >/dev/tty 2>&1; else exec >&2; fi
+        fi
+        if [[ $INSTALL_STARTED -eq 0 ]]; then
+            say_cleanup "this run installed no packages, so nothing was removed."
+        else
+            case "$PKG_MANAGER" in
+                apt-get)        apt_remove_installed ;;
+                dnf|yum|zypper) rpm_remove_installed ;;
+                apk)            apk_remove_installed ;;
+            esac
+        fi
+    fi
+    if [[ -n "$work" ]]; then rm -rf "$work"; fi
+    exit "$status"
+}
+
+# say_cleanup MESSAGE [PACKAGE...]: prints a cleanup outcome and the packages it concerns.
+say_cleanup() {
+    echo "Cleanup: $1"
+    shift
+    if [[ $# -gt 0 ]]; then printf '%s\n' "$*" | fold -s -w 76 | sed 's/ *$//; s/^/  /'; fi
+}
+
+# cleanup_left WHY COMMAND PACKAGE...: reports packages left installed, why, and the
+# command that removes them, so nothing the cleanup could not do goes unmentioned.
+cleanup_left() {
+    local why="$1" command="$2"
+    shift 2
+    say_cleanup "left installed, because $why:" "$@"
+    echo "  To remove them yourself: $command"
+}
+
+# cleanup_unattributed WHY COMMAND TOOLS PACKAGE...: reports that nothing was removed
+# because this run's own packages could not be told apart from what other programs
+# installed during the run, and lists the packages that appeared. The command offered
+# removes only TOOLS, the benchmark tools this run asked for that are now installed:
+# any of the other packages may belong to another program, so none is offered.
+cleanup_unattributed() {
+    local why="$1" command="$2" tools="$3"
+    shift 3
+    say_cleanup "removed nothing, because $why. These packages appeared during the run, installed by this run or by another program:" "$@"
+    if [[ -n "$tools" ]]; then
+        echo "  To remove the benchmark tools yourself: $command ${tools//$'\n'/ }  (it lists everything it will remove and asks first)"
+    fi
+}
+
+# --- apt (Debian, Ubuntu) ---
+
+# Runs apt-get as root, waiting up to five minutes for the dpkg lock instead of failing
+# at once while another package manager holds it, as unattended upgrades often does in
+# the first minutes after a server boots. apt 1.9.11 and later honor DPkg::Lock::Timeout;
+# older apt ignores options it does not know and fails at once, as it always did.
+apt_get() { as_root apt-get -o DPkg::Lock::Timeout=300 "$@"; }
+
+# apt-get update takes the package-list lock, which DPkg::Lock::Timeout does not cover,
+# so a failure that names that lock is retried for up to five minutes. The lock's path
+# is in apt's message in every language. Any other failure returns at once, with apt's
+# own message already on screen. The output is copied to a file in the run's temporary
+# directory to be searched; tee to /dev/stderr would truncate a log the user redirected
+# the run's output into.
+apt_update() {
+    local tries=0
+    until apt_get update 2>&1 | tee "$work/apt-update.log"; do
+        if ! grep -q "/lists/lock" "$work/apt-update.log" || (( ++tries > 30 )); then
+            return 1
+        fi
+        if [[ $tries -eq 1 ]]; then
+            echo "Another process is updating the package lists. Waiting up to five minutes for it to finish…"
+        fi
+        sleep 10
+    done
+}
+
+# Prints every package dpkg has any record of (installed, half installed, or only its
+# configuration files left), one per line. The architecture is dropped for native and
+# "all" packages so the names match the ones apt prints and logs.
+dpkg_known_packages() {
+    # shellcheck disable=SC2016 # ${...} is dpkg-query's format syntax, not the shell's
+    dpkg-query -W -f='${db:Status-Abbrev} ${Package}:${Architecture}\n' 2>/dev/null |
+        awk -v native="$(dpkg --print-architecture)" \
+            'substr($1, 2, 1) != "n" { sub(":(all|" native ")$", "", $2); print $2 }'
+}
+
+# Prints what this run's own apt transaction installed ("I name") and which existing
+# packages it upgraded ("U name"), from apt's history log. That log keeps an entry for
+# every apt transaction with its full command line, and this run's install carried its
+# RUN_ID there, so the entry found belongs to this run and to no other process. This is
+# what keeps a kernel that unattended upgrades installed during the run off the list.
+# It fails when the log cannot be read or is empty (history logging turned off, or the
+# log rotated away during the run), because then the absence of an entry proves nothing.
+apt_history_of_this_run() {
+    local log text
+    log="$(apt-config shell LOG Dir::Log::History/f 2>/dev/null | sed -n "s/^LOG='\(.*\)'$/\1/p")"
+    log="${log:-/var/log/apt/history.log}"
+    text="$( { if [[ -r "$log" ]]; then cat "$log"; else as_root cat "$log"; fi; } 2>/dev/null )" &&
+        [[ -n "$text" ]] || return 1
+    printf '%s\n' "$text" |
+        awk -v id="$RUN_ID" -v native="$(dpkg --print-architecture)" '
+            BEGIN { RS = "" }                          # one record per transaction
+            index($0, id) {
+                n = split($0, line, "\n")
+                for (i = 1; i <= n; i++) {
+                    if (line[i] ~ /^Install: /)      { kind = "I"; list = substr(line[i], 10) }
+                    else if (line[i] ~ /^Upgrade: /) { kind = "U"; list = substr(line[i], 10) }
+                    else continue
+                    gsub(/\([^)]*\)/, "", list)        # drop each "(version, automatic)"
+                    m = split(list, pkg, /[ ,]+/)
+                    for (j = 1; j <= m; j++) if (pkg[j] != "") {
+                        sub(":(all|" native ")$", "", pkg[j])
+                        print kind, pkg[j]
+                    }
+                }
+            }'
+}
+
+apt_remove_installed() {
+    local history now appeared installed upgraded had_record remove gone replacing sim sim_ok extra left removed
+    local -a pkgs
+    now="$(dpkg_known_packages)"
+    if ! history="$(apt_history_of_this_run)"; then
+        appeared="$(lines_not_in "$now" "$PKGS_BEFORE")"
+        if [[ -z "$appeared" ]]; then
+            say_cleanup "this run installed no packages, so nothing was removed."
+        else
+            mapfile -t pkgs <<<"$appeared"
+            cleanup_unattributed "apt's history log could not be read, so it cannot tell which packages this run installed" \
+                "$(root_prefix)apt-get purge" "$(lines_in "$(printf '%s\n' "${REQUESTED[@]}")" "$appeared")" "${pkgs[@]}"
+        fi
+        return
+    fi
+    if [[ -z "$history" ]]; then
+        # apt writes a history entry every time it runs dpkg, so no entry for this run means
+        # its apt-get changed no package: it had nothing to do because another program
+        # installed the tools first, or it failed before installing anything. Whatever
+        # appeared during the run is another program's, so none of it is listed.
+        say_cleanup "apt's history log has no record of this run installing any package, so nothing was removed."
+        return
+    fi
+
+    installed="$(awk '$1 == "I" { print $2 }' <<<"$history")"
+    upgraded="$(awk '$1 == "U" { print $2 }' <<<"$history")"
+    # A package dpkg knew before the run, for example one removed earlier but with its
+    # configuration files kept, is not purged: that would delete files that were already
+    # here. Removing it without purging returns it to the state it was in.
+    had_record="$(lines_in "$installed" "$PKGS_BEFORE")"
+    remove="$(lines_in "$(lines_not_in "$installed" "$PKGS_BEFORE")" "$now")"
+    # dpkg drops an installed package without apt asking ("disappears" it) when a new
+    # package replaces every one of its files, and apt's history does not mention that. A
+    # package this run installed whose Replaces field names a package that was here before
+    # and is gone now has taken that package's place, so it stays: removing it would leave
+    # neither. Tying it to the Replaces field keeps an unrelated package that another
+    # program removed during the run (an old kernel, say) from stopping the cleanup.
+    replacing=""
+    gone="$(lines_not_in "$PKGS_BEFORE" "$now")"
+    if [[ -n "$gone" && -n "$remove" ]]; then
+        replacing="$(dpkg_replacements "$remove" "$gone")"
+        remove="$(lines_not_in "$remove" "$(awk '{ print $1 }' <<<"$replacing")")"
+    fi
+
+    if [[ -z "$remove" && -z "$had_record" && -z "$replacing" ]]; then
+        say_cleanup "this run installed no packages, so nothing was removed."
+    fi
+    if [[ -n "$remove" ]]; then
+        mapfile -t pkgs <<<"$remove"
+        # Ask apt what purging these would take with it. Anything else on that list (a
+        # package installed since that depends on one of them) means nothing is removed.
+        sim_ok=1
+        sim="$(LC_ALL=C apt-get -s -o DPkg::Lock::Timeout=300 purge "${pkgs[@]}" 2>&1)" || sim_ok=0
+        extra="$(awk -v native="$(dpkg --print-architecture)" '
+            $1 == "Purg" || $1 == "Remv" { sub(":(all|" native ")$", "", $2); print $2 }
+            $1 == "Inst"                 { print "(would install) " $2 }' <<<"$sim")"
+        extra="$(lines_not_in "$extra" "$remove")"
+        if [[ $sim_ok -eq 0 ]]; then
+            printf '%s\n' "$sim" >&2
+            cleanup_left "apt-get could not work out their removal (its message is above)" \
+                "$(root_prefix)apt-get purge ${pkgs[*]}" "${pkgs[@]}"
+        elif [[ -n "$extra" ]]; then
+            cleanup_left "removing them would also remove packages this run did not install (${extra//$'\n'/, })" \
+                "$(root_prefix)apt-get purge ${pkgs[*]}  (apt lists everything it will remove and asks first)" "${pkgs[@]}"
+        else
+            # dpkg rather than apt-get does the removal. dpkg removes only the packages it
+            # is given and refuses outright if anything else still depends on one of them,
+            # whereas apt-get would remove the dependent package as well, and could do so
+            # after waiting out another process's lock during which that dependent appeared.
+            dpkg_purge "${pkgs[@]}"
+            left="$(lines_in "$remove" "$(dpkg_known_packages)")"
+            removed="$(lines_not_in "$remove" "$left")"
+            if [[ -n "$removed" ]]; then
+                mapfile -t pkgs <<<"$removed"
+                say_cleanup "removed the ${#pkgs[@]} packages this run installed:" "${pkgs[@]}"
+            fi
+            if [[ -n "$left" ]]; then
+                mapfile -t pkgs <<<"$left"
+                cleanup_left "dpkg could not remove them (its message is above)" \
+                    "$(root_prefix)apt-get purge ${pkgs[*]}" "${pkgs[@]}"
+            fi
+        fi
+    fi
+    if [[ -n "$had_record" ]]; then
+        mapfile -t pkgs <<<"$had_record"
+        cleanup_left "dpkg already had a record of them before this run (such as leftover configuration files)" \
+            "$(root_prefix)apt-get remove ${pkgs[*]}" "${pkgs[@]}"
+    fi
+    if [[ -n "$replacing" ]]; then
+        mapfile -t pkgs < <(awk '{ print $1 " (in place of " $2 ")" }' <<<"$replacing")
+        say_cleanup "left installed, because each took the place of a package that was here before the run, so removing it would leave neither:" "${pkgs[@]}"
+    fi
+    if [[ -n "$upgraded" ]]; then
+        mapfile -t pkgs <<<"$upgraded"
+        say_cleanup "apt also upgraded these packages that were already installed. They stay upgraded:" "${pkgs[@]}"
+    fi
+}
+
+# dpkg_replacements CANDIDATES GONE: prints "NEW OLD" for each package in CANDIDATES whose
+# Replaces field names a package in GONE. Names are compared without the architecture,
+# and the version limits and architecture qualifiers in the field are ignored, so any
+# doubt counts as a replacement and keeps the package. dpkg-query answers a bare name
+# with every architecture it is installed for, so only the candidates themselves count.
+dpkg_replacements() {
+    local -a pkgs
+    mapfile -t pkgs <<<"$1"
+    # shellcheck disable=SC2016 # ${...} is dpkg-query's format syntax, not the shell's
+    dpkg-query -W -f='${Package}:${Architecture}\t${Replaces}\n' "${pkgs[@]}" 2>/dev/null |
+        awk -F '\t' -v native="$(dpkg --print-architecture)" '
+            FILENAME == ARGV[1] { candidate[$0]; next }
+            FILENAME == ARGV[2] { name = $0; sub(/:.*/, "", name); gone[name] = $0; next }
+            {
+                pkg = $1; sub(":(all|" native ")$", "", pkg)
+                if (!(pkg in candidate)) next
+                n = split($2, replaces, ",")
+                for (i = 1; i <= n; i++) {
+                    name = replaces[i]; sub(/^ +/, "", name); sub(/[ :(].*/, "", name)
+                    if (name in gone) print pkg, gone[name]
+                }
+            }' <(printf '%s\n' "$1") <(printf '%s\n' "$2") -
+}
+
+# Runs dpkg --purge, retrying for up to five minutes while another package manager holds
+# the dpkg lock (dpkg itself does not wait). Retrying is safe because dpkg --purge never
+# removes anything it was not given. On failure, dpkg's message is printed.
+dpkg_purge() {
+    local out tries=0
+    until out="$(as_root_uninterruptible env LC_ALL=C dpkg --purge "$@" 2>&1)"; do
+        if [[ "$out" != *"locked by another process"* ]] || (( ++tries > 30 )) ||
+           [[ $CLEANUP_INTERRUPTED -eq 1 ]]; then
+            printf '%s\n' "$out" >&2
+            return 1
+        fi
+        if [[ $tries -eq 1 ]]; then
+            echo "Cleanup: another package manager is running. Waiting up to five minutes for it to finish…"
+        fi
+        sleep 10
+    done
+}
+
+# --- dnf, yum, zypper (all install through rpm) ---
+#
+# rpm stamps every package with the id of the transaction that installed it
+# (INSTALLTID), so this run's packages are the new ones that share the id of the
+# transaction that installed the tools it asked for. A transaction that ran alongside
+# (dnf-automatic installing a kernel, say) normally has its own id and is left alone.
+# The id is the second the transaction began, though, so one begun in the same second
+# shares it. What tells the two apart is the package manager's own output for this run,
+# which names every package it installed or upgraded: a package carrying this run's id
+# that the output does not name belongs to another program, and then nothing is removed.
+
+rpm_install() {
+    case "$PKG_MANAGER" in
+        # zypper fails at once while another zypper holds its lock unless told to wait.
+        zypper) set -- env ZYPP_LOCK_TIMEOUT=300 zypper install -y "$@" ;;
+        *)      set -- "$PKG_MANAGER" install -y "$@" ;;
+    esac
+    if [[ $CLEANUP -eq 0 ]]; then
+        as_root "$@"
+        return
+    fi
+    RPM_T0="$(date +%s)"
+    as_root env LC_ALL=C "$@" 2>&1 | tee "$work/rpm-install.log" || return 1
+    # If another process installed the tools first, this run's install did nothing,
+    # and the transaction that did install them is not this run's to undo.
+    if grep -q "Nothing to do" "$work/rpm-install.log"; then RPM_NOTHING_DONE=1; fi
+}
+
+rpm_remove_installed() {
+    local now new ours tools group unconfirmed candidates upgraded gone replacing remove keys out left
+    local -a pkgs
+    if [[ $RPM_NOTHING_DONE -eq 1 ]]; then
+        say_cleanup "this run installed no packages, so nothing was removed."
+        return
+    fi
+    # One line per package: INSTALLTID NAME.ARCH NAME-VERSION-RELEASE.ARCH NAME VERSION-RELEASE ARCH
+    now="$(rpm -qa --qf '%{INSTALLTID} %{NAME}.%{ARCH} %{NAME}-%{VERSION}-%{RELEASE}.%{ARCH} %{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n')"
+    # New means the name and architecture were absent before, so an existing package
+    # that the transaction upgraded as a dependency is never counted as new.
+    new="$(awk 'NR == FNR { before[$1]; next } NF && !($2 in before)' \
+        <(printf '%s\n' "$PKGS_BEFORE") <(printf '%s\n' "$now"))"
+    if [[ -z "$new" ]]; then
+        say_cleanup "this run installed no packages, so nothing was removed."
+        return
+    fi
+    ours="$(awk -v asked=" ${REQUESTED[*]} " 'index(asked, " " $4 " ") { print $1 }' <<<"$new" | sort -u)"
+    tools="$(awk -v asked=" ${REQUESTED[*]} " 'index(asked, " " $4 " ") { print $4 }' <<<"$new" | sort -u)"
+    # Exactly one transaction must have installed the requested tools, and it must have
+    # started after this run's install did. Anything else is left for the user to judge.
+    if [[ ! "$ours" =~ ^[0-9]+$ ]] || (( ours < RPM_T0 )); then
+        mapfile -t pkgs < <(awk '{ print $3 }' <<<"$new")
+        cleanup_unattributed "the requested tools were not installed by one transaction that began during this run" \
+            "$(root_prefix)$PKG_MANAGER remove" "$tools" "${pkgs[@]}"
+        return
+    fi
+    # Package signing keys are listed by rpm as packages too. dnf imports them through rpm
+    # just before the transaction, possibly within the same second, and never names them
+    # the way it names packages, so they are reported apart and never removed.
+    group="$(awk -v tid="$ours" '$1 == tid && $4 != "gpg-pubkey"' <<<"$now")"
+    unconfirmed="$(lines_not_in "$(awk '{ print $3 }' <<<"$group")" "$(rpm_named_in_install_log <<<"$group")")"
+    if [[ -n "$unconfirmed" ]]; then
+        mapfile -t pkgs < <(awk -v tid="$ours" '$1 == tid && $4 != "gpg-pubkey" { print $3 }' <<<"$new")
+        cleanup_unattributed "rpm records these packages under this run's transaction, but $PKG_MANAGER's output for this run does not name them all (another program's install begun in the same second shares the record)" \
+            "$(root_prefix)$PKG_MANAGER remove" "$tools" "${pkgs[@]}"
+        return
+    fi
+    candidates="$(awk 'NR == FNR { before[$1]; next } !($2 in before)' <(printf '%s\n' "$PKGS_BEFORE") <(printf '%s\n' "$group"))"
+    upgraded="$(awk 'NR == FNR { before[$1]; next } ($2 in before) { print $3 }' <(printf '%s\n' "$PKGS_BEFORE") <(printf '%s\n' "$group"))"
+    # A new package can take the place of one that was here before: the same name built
+    # for another architecture (noarch to x86_64), or a package that obsoletes the old one,
+    # as a renamed package does. rpm erases the old one in the same transaction, so such a
+    # package stays, like an upgrade: removing it would leave neither.
+    replacing=""
+    gone="$(lines_not_in "$(awk '{ print $1 }' <<<"$PKGS_BEFORE")" "$(awk '{ print $2 }' <<<"$now")")"
+    if [[ -n "$gone" ]]; then replacing="$(rpm_replacements "$candidates" "$gone")"; fi
+    remove="$(lines_not_in "$(awk '{ print $3 }' <<<"$candidates")" "$(awk '{ print $1 }' <<<"$replacing")")"
+    keys="$(awk 'NR == FNR { before[$2]; next } $4 == "gpg-pubkey" && !($3 in before) { print $3 }' \
+        <(printf '%s\n' "$PKGS_BEFORE") <(printf '%s\n' "$now"))"
+
+    if [[ -n "$remove" ]]; then
+        mapfile -t pkgs <<<"$remove"
+        # rpm -e rather than the package manager does the removal: it removes only the
+        # packages it is given and refuses if anything else still needs one of them, where
+        # dnf remove would take dependent packages along and could clean out unrelated
+        # leftover dependencies. The --test run checks all of them first, so it is all or none.
+        if ! out="$(as_root rpm -e --test "${pkgs[@]}" 2>&1)"; then
+            printf '%s\n' "$out" >&2
+            cleanup_left "removing them would affect packages this run did not install (rpm's message is above)" \
+                "$(root_prefix)$PKG_MANAGER remove ${pkgs[*]}" "${pkgs[@]}"
+        else
+            if ! out="$(as_root_uninterruptible rpm -e "${pkgs[@]}" 2>&1)"; then printf '%s\n' "$out" >&2; fi
+            left="$(rpm -q "${pkgs[@]}" 2>/dev/null | grep -v '^package ' || true)"
+            mapfile -t pkgs < <(lines_not_in "$remove" "$left")
+            if [[ ${#pkgs[@]} -gt 0 ]]; then
+                say_cleanup "removed the ${#pkgs[@]} packages this run installed:" "${pkgs[@]}"
+            fi
+            if [[ -n "$left" ]]; then
+                mapfile -t pkgs <<<"$left"
+                cleanup_left "rpm could not remove them (its message is above)" \
+                    "$(root_prefix)$PKG_MANAGER remove ${pkgs[*]}" "${pkgs[@]}"
+            fi
+        fi
+    fi
+    if [[ -n "$replacing" ]]; then
+        mapfile -t pkgs < <(awk '{ print $1 " (in place of " $2 ")" }' <<<"$replacing")
+        say_cleanup "left installed, because each took the place of a package that was here before the run, so removing it would leave neither:" "${pkgs[@]}"
+    fi
+    if [[ -n "$upgraded" ]]; then
+        mapfile -t pkgs <<<"$upgraded"
+        say_cleanup "$PKG_MANAGER also upgraded these packages that were already installed. They stay upgraded:" "${pkgs[@]}"
+    fi
+    if [[ -n "$keys" ]]; then
+        mapfile -t pkgs <<<"$keys"
+        say_cleanup "these package signing keys were imported during the run (a package manager imports one the first time it installs from a repository). They stay:" "${pkgs[@]}"
+    fi
+}
+
+# Reads packages as rpm_remove_installed lists them and prints the NAME-VERSION-RELEASE.ARCH
+# of each one that this run's install output names. dnf, yum and zypper name a package
+# either as one word, NAME-VERSION-RELEASE.ARCH (their progress lines), or as the three
+# columns NAME ARCH VERSION-RELEASE (the transaction table). Some versions add the epoch
+# ("0:") in front of the version or the name, so it is dropped before comparing. With no
+# output kept, nothing is named, and the caller removes nothing.
+rpm_named_in_install_log() {
+    [[ -r "$work/rpm-install.log" ]] || return 0
+    awk 'NR == FNR {
+            for (i = 1; i <= NF; i++) {
+                w = $i
+                sub(/^[0-9]+:/, "", w)
+                while (match(w, /-[0-9]+:/)) w = substr(w, 1, RSTART) substr(w, RSTART + RLENGTH)
+                word[w]; f[i] = w
+            }
+            for (i = 1; i + 2 <= NF; i++) row[f[i] " " f[i + 1] " " f[i + 2]]
+            next
+        }
+        ($3 in word) || (($4 " " $6 " " $5) in row) { print $3 }' "$work/rpm-install.log" -
+}
+
+# rpm_replacements CANDIDATES GONE: prints "NEW OLD" for each package in CANDIDATES (lines
+# as rpm_remove_installed lists them) that has the name of a package in GONE (NAME.ARCH
+# lines), or obsoletes that name.
+rpm_replacements() {
+    local -a nvras
+    mapfile -t nvras < <(awk '{ print $3 }' <<<"$1")
+    {
+        awk '{ print $3, $4 }' <<<"$1"
+        rpm -q --qf '[%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH} %{OBSOLETENAME}\n]' "${nvras[@]}" 2>/dev/null
+    } | awk 'NR == FNR { name = $0; sub(/\.[^.]*$/, "", name); gone[name] = $0; next }
+             ($2 in gone) { print $1, gone[$2] }' <(printf '%s\n' "$2") - | sort -u
+}
+
+# --- apk (Alpine) ---
+#
+# With --cleanup the tools are installed under a virtual package named for this run.
+# Deleting it removes only the packages nothing else still needs: anything installed
+# before the run, or by another process during it, is needed by the system's own list
+# of wanted packages and stays. So does a package that took the place of one the system
+# wanted, since the system now needs it in the old one's place.
+
+apk_remove_installed() {
+    local virtual=".vhr-bench-$RUN_ID" appeared sim purged extra before_del gone out
+    local -a pkgs
+    if ! apk info -e "$virtual" >/dev/null 2>&1; then
+        appeared="$(lines_not_in "$(apk info 2>/dev/null)" "$PKGS_BEFORE")"
+        if [[ -z "$appeared" ]]; then
+            say_cleanup "this run installed no packages, so nothing was removed."
+        else
+            mapfile -t pkgs <<<"$appeared"
+            cleanup_unattributed "the install did not complete, so it cannot tell which packages this run installed" \
+                "$(root_prefix)apk del" "$(lines_in "$(printf '%s\n' "${REQUESTED[@]}")" "$appeared")" "${pkgs[@]}"
+        fi
+        return
+    fi
+    if ! sim="$(as_root apk del --simulate "$virtual" 2>&1)"; then
+        printf '%s\n' "$sim" >&2
+        cleanup_left "apk could not work out their removal (its message is above)" \
+            "$(root_prefix)apk del $virtual" "${REQUESTED[@]}"
+        return
+    fi
+    # apk prints "(3/9) Purging name (version)", padding the count once there are ten or more.
+    purged="$(sed -n 's/^( *[0-9]*\/[0-9]*) Purging \([^ ]*\) .*/\1/p' <<<"$sim" | grep -vxF "$virtual" || true)"
+    extra="$(lines_not_in "$purged" "$(lines_not_in "$(apk info)" "$PKGS_BEFORE")")"
+    if [[ -n "$extra" ]]; then
+        cleanup_left "removing them would also remove packages that were here before (${extra//$'\n'/, })" \
+            "$(root_prefix)apk del $virtual" "${REQUESTED[@]}"
+        return
+    fi
+    before_del="$(apk info)"
+    if ! out="$(as_root_uninterruptible apk del "$virtual" 2>&1)"; then
+        printf '%s\n' "$out" >&2
+        cleanup_left "apk could not remove them (its message is above)" "$(root_prefix)apk del $virtual" "${REQUESTED[@]}"
+        return
+    fi
+    gone="$(lines_not_in "$before_del" "$(apk info)")"
+    mapfile -t pkgs < <(lines_not_in "$gone" "$virtual")
+    if [[ ${#pkgs[@]} -gt 0 ]]; then
+        say_cleanup "removed the ${#pkgs[@]} packages this run installed:" "${pkgs[@]}"
+    else
+        say_cleanup "this run installed no packages, so nothing was removed."
+    fi
+}
+
+# --- Benchmark helpers --------------------------------------------------------
 
 # Both parsers end in "|| true": under pipefail a grep that matches nothing would
 # otherwise end the whole script without a word when fio fails on a server.
@@ -107,64 +680,198 @@ parse_bw_mbps() { # $1 = fio normal output; echoes MB/s from the "(NNNMB/s)" fig
         printf "%.2f", v*m }' || true
 }
 
-echo "Running disk read benchmark (fio)…"
-rr="$(fio --name=randread --directory="$work" --ioengine=libaio --iodepth=16 --rw=randread \
-      --bs=4k --direct=1 --size=256M --numjobs=1 --runtime=15 --time_based --group_reporting 2>/dev/null || true)"
-disk_read_iops="$(parse_iops "$rr")"; disk_read_iops="${disk_read_iops:-0}"
-disk_read_mbps="$(parse_bw_mbps "$rr")"; disk_read_mbps="${disk_read_mbps:-0}"
-
-echo "Running disk write benchmark (fio)…"
-rw="$(fio --name=randwrite --directory="$work" --ioengine=libaio --iodepth=16 --rw=randwrite \
-      --bs=4k --direct=1 --size=256M --numjobs=1 --runtime=15 --time_based --group_reporting 2>/dev/null || true)"
-disk_write_iops="$(parse_iops "$rw")"; disk_write_iops="${disk_write_iops:-0}"
-disk_write_mbps="$(parse_bw_mbps "$rw")"; disk_write_mbps="${disk_write_mbps:-0}"
-
-# --- Results ----------------------------------------------------------------
 # A zero means the benchmark failed or printed nothing readable, so it is shown as
 # not measured rather than as a result, and it is never uploaded.
 is_zero() { [[ "$1" =~ ^0+(\.0+)?$ ]]; }
 show() { # $1 = the value, $2 = the line to print when it is a real reading
     if is_zero "$1"; then echo "not measured"; else echo "$2"; fi
 }
-missing=()
-if is_zero "$cpu_events";        then missing+=("processor");  fi
-if is_zero "$memory_mb_per_sec"; then missing+=("memory");     fi
-if is_zero "$disk_read_iops";    then missing+=("disk read");  fi
-if is_zero "$disk_write_iops";   then missing+=("disk write"); fi
 
-echo
-echo "vhr-bench results"
-echo "------------------------------------------------------------"
-printf '  %-11s %s\n' "Processor" "$(show "$cpu_events" "$cpu_events events/s (sysbench, $cpu_cores threads)")"
-printf '  %-11s %s\n' "Memory" "$(show "$memory_mb_per_sec" "$memory_mb_per_sec MB/s (sysbench, 1M block writes)")"
-printf '  %-11s %s\n' "Disk read" "$(show "$disk_read_iops" "$disk_read_iops IOPS, $disk_read_mbps MB/s (fio, random 4k)")"
-printf '  %-11s %s\n' "Disk write" "$(show "$disk_write_iops" "$disk_write_iops IOPS, $disk_write_mbps MB/s (fio, random 4k)")"
-printf '  %-11s %s, %s cores, %s MB RAM\n' "Hardware" "$cpu_model" "$cpu_cores" "$ram_total_mb"
-printf '  %-11s %s, kernel %s, %s\n' "System" "${distro:-unknown}" "${kernel:-unknown}" "$virt_type"
-echo "------------------------------------------------------------"
-
-if [[ ${#missing[@]} -gt 0 ]]; then
-    printf -v missing_list '%s, ' "${missing[@]}"
-    echo
-    echo "Not measured: ${missing_list%, }. The benchmark behind each of these failed or"
-    echo "printed nothing readable on this server, so nothing was uploaded."
-    exit 1
-fi
-
-if [[ -z "$TOKEN" ]]; then
-    echo
-    echo "Nothing was uploaded. To compare this server with results from other hosts,"
-    echo "create a free account, copy your upload token from"
-    echo "https://vpshostreview.com/user/benchmarks and run:"
-    echo "  vhr-bench --token YOUR_UPLOAD_TOKEN"
-    echo "Published comparisons: https://vpshostreview.com/vps-benchmarks"
-    exit 0
-fi
-
-# --- Build payload ----------------------------------------------------------
 json_escape() { echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
-payload=$(cat <<EOF
+# The command that runs vhr-bench again the way this run was started, for the hint
+# printed after a run without a token. Run from a file, BASH_SOURCE names that file.
+# Piped into bash there is no file, and bash puts a stand-in there instead (its own name,
+# or "main"), which can be the name of a real file too: /usr/bin/bash when the run starts
+# in /usr/bin, or anything called bash or main in the current directory. So the file
+# counts only if it holds this very function.
+rerun_command() {
+    if grep -qsxF 'rerun_command() {' "${BASH_SOURCE[0]}"; then
+        echo "vhr-bench"
+    elif [[ $CLEANUP -eq 1 ]]; then
+        echo "curl -fsSL https://github.com/vpshostreview/vhr-vps-benchmark/releases/latest/download/vhr-bench | bash -s -- --cleanup"
+    else
+        echo "curl -fsSL https://github.com/vpshostreview/vhr-vps-benchmark/releases/latest/download/vhr-bench | bash -s --"
+    fi
+}
+
+# --- Main ---------------------------------------------------------------------
+main() {
+    set -euo pipefail
+
+    local DEFAULT_API_URL="https://vpshostreview.com/api/benchmarks/submit"
+    API_URL="${VHR_BENCHMARK_API_URL:-$DEFAULT_API_URL}"
+    TOKEN="${VHR_BENCHMARK_TOKEN:-}"
+    ASSUME_YES=0
+    CLEANUP=0
+
+    # State read by the EXIT trap and the cleanup functions.
+    work=""
+    PKG_MANAGER=""
+    REQUESTED=()
+    INSTALL_STARTED=0
+    PKGS_BEFORE=""
+    RUN_ID=""
+    RPM_T0=0
+    RPM_NOTHING_DONE=0
+
+    # --- Argument parsing ---------------------------------------------------
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --token)   [[ $# -ge 2 ]] || err "--token needs a value"; TOKEN="$2"; shift 2 ;;
+            --api-url) [[ $# -ge 2 ]] || err "--api-url needs a value"; API_URL="$2"; shift 2 ;;
+            --cleanup) CLEANUP=1; shift ;;
+            -y|--yes)  ASSUME_YES=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) echo "Unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    # From here on every way out of the run passes through on_exit, which removes the
+    # temporary directory and, with --cleanup, the packages this run installed. Each
+    # signal that would end the run is turned into an exit so that on_exit runs: Ctrl+C,
+    # a hangup, output with no reader left, and a plain kill. A hangup needs its own trap:
+    # left to bash's default handling, the second hangup that the running benchmark's
+    # subshell passes on arrives while on_exit runs and ends it partway.
+    trap on_exit EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 141' PIPE
+    trap 'exit 143' TERM
+    # The directory holds the fio test files and the package managers' output. fio
+    # measures the disk under the directory it writes to, so it is not /tmp: that is
+    # often a tmpfs held in memory (on Fedora, and on new Debian 13 installs), and since
+    # Linux 6.6 tmpfs accepts the direct I/O that used to fail there, so fio would report
+    # memory speed as disk speed. /var/tmp is kept on disk by convention. The usual
+    # temporary directory is only the fallback, and the check before the disk benchmarks
+    # catches any directory that turns out to be held in memory.
+    work="$(mktemp -d /var/tmp/vhr-bench.XXXXXX 2>/dev/null || mktemp -d)" ||
+        err "Could not create a temporary directory for the benchmark files (the message is above)."
+
+    # --- Dependency check / install -----------------------------------------
+    # curl is only needed to upload, so a run without a token does not ask for it.
+    local need_install=()
+    command -v sysbench >/dev/null 2>&1 || need_install+=("sysbench")
+    command -v fio      >/dev/null 2>&1 || need_install+=("fio")
+    if [[ -n "$TOKEN" ]]; then
+        command -v curl >/dev/null 2>&1 || need_install+=("curl")
+    fi
+
+    if [[ ${#need_install[@]} -gt 0 ]]; then
+        echo "This tool needs: ${need_install[*]}"
+        local how=" (requires sudo)"
+        if is_root; then
+            how=""
+        elif ! command -v sudo >/dev/null 2>&1; then
+            err "Installing them needs root, and sudo is not installed. Run this as root, or install ${need_install[*]} first."
+        fi
+        if [[ $CLEANUP -eq 1 ]]; then
+            echo "With --cleanup they are removed again when the run ends, along with anything installed for them."
+        fi
+        if [[ $ASSUME_YES -eq 0 ]]; then
+            ask "Install them now with your package manager${how}?" ||
+                err "Cannot continue without: ${need_install[*]}"
+        fi
+        install_packages "${need_install[@]}"
+    fi
+
+    # --- System context -----------------------------------------------------
+    local cpu_cores cpu_model mem_kb ram_total_mb distro kernel virt_type
+    cpu_cores="$(nproc 2>/dev/null || echo 1)"
+    cpu_model="$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | sed 's/.*: //; s/[[:space:]]*$//' || echo '')"
+    [[ -n "$cpu_model" ]] || cpu_model="$(uname -p 2>/dev/null || echo unknown)"
+    mem_kb="$(grep -m1 MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo 0)"
+    ram_total_mb="$(( mem_kb / 1024 ))"
+    # shellcheck disable=SC1091 # os-release is the server's own file, read at run time
+    distro="$( ( . /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-}" ) || echo '')"
+    kernel="$(uname -r 2>/dev/null || echo '')"
+    virt_type="$(systemd-detect-virt 2>/dev/null || echo 'unknown')"
+
+    # --- Benchmarks ---------------------------------------------------------
+    local cpu_out cpu_events mem_out mem_mibs memory_mb_per_sec rr rw
+    local disk_read_iops disk_read_mbps disk_write_iops disk_write_mbps
+    echo "Running CPU benchmark (sysbench)…"
+    cpu_out="$(sysbench cpu --cpu-max-prime=20000 --threads="$cpu_cores" --time=10 run 2>/dev/null || true)"
+    cpu_events="$(echo "$cpu_out" | grep -oE 'events per second:[[:space:]]*[0-9.]+' | grep -oE '[0-9.]+$' | head -1 || true)"
+    cpu_events="${cpu_events:-0}"
+
+    echo "Running memory benchmark (sysbench)…"
+    mem_out="$(sysbench memory --memory-block-size=1M --memory-total-size=10G --memory-oper=write run 2>/dev/null || true)"
+    mem_mibs="$(echo "$mem_out" | grep -oE '\([0-9.]+ MiB/sec\)' | grep -oE '[0-9.]+' | head -1 || true)"
+    mem_mibs="${mem_mibs:-0}"
+    memory_mb_per_sec="$(awk -v v="$mem_mibs" 'BEGIN{ printf "%.2f", v * 1.048576 }')"
+
+    # A directory held in memory would give memory figures under the disk's name, so the
+    # disk is left unmeasured there, which also keeps the result from being uploaded.
+    local work_fs
+    work_fs="$(stat -f -c %T "$work" 2>/dev/null || true)"
+    if [[ "$work_fs" == tmpfs || "$work_fs" == ramfs ]]; then
+        echo "Skipping the disk benchmarks: ${work%/*} is a $work_fs filesystem held in memory, so fio"
+        echo "would measure memory rather than the disk."
+        rr=""; rw=""
+    else
+        echo "Running disk read benchmark (fio)…"
+        rr="$(fio --name=randread --directory="$work" --ioengine=libaio --iodepth=16 --rw=randread \
+              --bs=4k --direct=1 --size=256M --numjobs=1 --runtime=15 --time_based --group_reporting 2>/dev/null || true)"
+
+        echo "Running disk write benchmark (fio)…"
+        rw="$(fio --name=randwrite --directory="$work" --ioengine=libaio --iodepth=16 --rw=randwrite \
+              --bs=4k --direct=1 --size=256M --numjobs=1 --runtime=15 --time_based --group_reporting 2>/dev/null || true)"
+    fi
+    disk_read_iops="$(parse_iops "$rr")"; disk_read_iops="${disk_read_iops:-0}"
+    disk_read_mbps="$(parse_bw_mbps "$rr")"; disk_read_mbps="${disk_read_mbps:-0}"
+    disk_write_iops="$(parse_iops "$rw")"; disk_write_iops="${disk_write_iops:-0}"
+    disk_write_mbps="$(parse_bw_mbps "$rw")"; disk_write_mbps="${disk_write_mbps:-0}"
+
+    # --- Results ------------------------------------------------------------
+    local missing=() missing_list
+    if is_zero "$cpu_events";        then missing+=("processor");  fi
+    if is_zero "$memory_mb_per_sec"; then missing+=("memory");     fi
+    if is_zero "$disk_read_iops";    then missing+=("disk read");  fi
+    if is_zero "$disk_write_iops";   then missing+=("disk write"); fi
+
+    echo
+    echo "vhr-bench results"
+    echo "------------------------------------------------------------"
+    printf '  %-11s %s\n' "Processor" "$(show "$cpu_events" "$cpu_events events/s (sysbench, $cpu_cores threads)")"
+    printf '  %-11s %s\n' "Memory" "$(show "$memory_mb_per_sec" "$memory_mb_per_sec MB/s (sysbench, 1M block writes)")"
+    printf '  %-11s %s\n' "Disk read" "$(show "$disk_read_iops" "$disk_read_iops IOPS, $disk_read_mbps MB/s (fio, random 4k)")"
+    printf '  %-11s %s\n' "Disk write" "$(show "$disk_write_iops" "$disk_write_iops IOPS, $disk_write_mbps MB/s (fio, random 4k)")"
+    printf '  %-11s %s, %s cores, %s MB RAM\n' "Hardware" "$cpu_model" "$cpu_cores" "$ram_total_mb"
+    printf '  %-11s %s, kernel %s, %s\n' "System" "${distro:-unknown}" "${kernel:-unknown}" "$virt_type"
+    echo "------------------------------------------------------------"
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        printf -v missing_list '%s, ' "${missing[@]}"
+        echo
+        echo "Not measured: ${missing_list%, }. The benchmark behind each of these failed or"
+        echo "printed nothing readable on this server, so nothing was uploaded."
+        exit 1
+    fi
+
+    if [[ -z "$TOKEN" ]]; then
+        echo
+        echo "Nothing was uploaded. To compare this server with results from other hosts,"
+        echo "create a free account, copy your upload token from"
+        echo "https://vpshostreview.com/user/benchmarks and run:"
+        echo "  $(rerun_command) --token YOUR_UPLOAD_TOKEN"
+        echo "Published comparisons: https://vpshostreview.com/vps-benchmarks"
+        exit 0
+    fi
+
+    # --- Build payload ------------------------------------------------------
+    local payload response review_url
+    payload=$(cat <<EOF
 {
   "cpuEventsPerSec": ${cpu_events},
   "memoryMbPerSec": ${memory_mb_per_sec},
@@ -182,33 +889,39 @@ payload=$(cat <<EOF
 EOF
 )
 
-echo
-echo "This is the exact data that will be uploaded to your account:"
-echo "------------------------------------------------------------"
-echo "$payload"
-echo "------------------------------------------------------------"
+    echo
+    echo "This is the exact data that will be uploaded to your account:"
+    echo "------------------------------------------------------------"
+    echo "$payload"
+    echo "------------------------------------------------------------"
 
-if [[ $ASSUME_YES -eq 0 ]]; then
-    read -r -p "Upload this result to your VPS Host Review account? [y/N] " reply
-    [[ "$reply" =~ ^[Yy]$ ]] || { echo "Aborted. Nothing was uploaded."; exit 0; }
-fi
+    if [[ $ASSUME_YES -eq 0 ]]; then
+        ask "Upload this result to your VPS Host Review account?" ||
+            { echo "Aborted. Nothing was uploaded."; exit 0; }
+    fi
 
-echo "Uploading…"
-response="$(curl -fsS -X POST "$API_URL" \
-    -H "Authorization: Bearer ${TOKEN}" \
-    -H "Content-Type: application/json" \
-    -d "$payload" 2>&1)" || err "Upload failed: $response"
+    echo "Uploading…"
+    response="$(curl -fsS -X POST "$API_URL" \
+        -H "Authorization: Bearer ${TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "$payload" 2>&1)" || err "Upload failed: $response"
 
-echo "Done. Server response:"
-echo "$response"
-echo
-# The server answers with the address of the review form for this result. A result is
-# published only through a review of the host it measured, so that is the next step;
-# the portal link stays as the fallback for a response the pattern does not match.
-review_url="$(printf '%s' "$response" | sed -n 's/.*"reviewUrl":"\([^"]*\)".*/\1/p')"
-if [[ -n "$review_url" ]]; then
-    echo "Publish it by reviewing the host you just measured: ${review_url}"
-    echo "The result is attached to that review when you submit it."
-else
-    echo "Publish it by reviewing the host you measured: https://vpshostreview.com/user/benchmarks"
-fi
+    echo "Done. Server response:"
+    echo "$response"
+    echo
+    # The server answers with the address of the review form for this result. A result is
+    # published only through a review of the host it measured, so that is the next step;
+    # the portal link stays as the fallback for a response the pattern does not match.
+    review_url="$(printf '%s' "$response" | sed -n 's/.*"reviewUrl":"\([^"]*\)".*/\1/p')"
+    if [[ -n "$review_url" ]]; then
+        echo "Publish it by reviewing the host you just measured: ${review_url}"
+        echo "The result is attached to that review when you submit it."
+    else
+        echo "Publish it by reviewing the host you measured: https://vpshostreview.com/user/benchmarks"
+    fi
+}
+
+# The braces matter: a download cut off inside this line (after "main" but before its
+# arguments, say) leaves an unclosed group that bash refuses to run, rather than a bare
+# "main" that would run without the options the command line gave.
+{ main "$@"; }
